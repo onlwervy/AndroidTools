@@ -1,82 +1,198 @@
+
 package com.http.helper;
 
+import android.content.Context;
+import android.os.AsyncTask;
+import android.text.TextUtils;
+import android.util.Log;
+
+import org.apache.http.HttpResponse;
+import org.apache.http.HttpStatus;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.apache.http.params.BasicHttpParams;
+import org.apache.http.params.HttpConnectionParams;
+
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
-import java.net.URL;
+import java.io.OutputStream;
 
-import android.os.Environment;
-
-public class DownloadTask implements Runnable {
-
-    public interface DownloadCallback {
-        void onDownloadStart(int taskId, int fileLength);
-        void onDownloadProgress(int taskId, int progress, int progressCount);
-        void onDownloadFinished(int taskId, String filePath, String errorMsg);
-    }
-
-    private int taskId = 0;
-    private String url;
-    private String fileDir;
-    private String fileName;
+/**
+ * 下载任务
+ * <p>
+ * 参数为url及保存路径
+ */
+public class DownloadTask extends
+        AsyncTask<String, Integer, DownloadTask.State> {
+    public static final int REQUEST_TIMEOUT = 60 * 1000;
     
-    private int timeoutMillis;
-    private DownloadCallback callback;
-    private boolean canceled = false;
-
-    public DownloadTask(String url) {
-        this.url = url;
-        fileDir = Environment.getExternalStorageDirectory().getAbsolutePath() + "/";
-        fileName = url.substring(url.lastIndexOf(File.separator) + 1);
+    public static enum State {
+        SUCCESS, HTTP_IO_ERROR, FILE_IO_ERROR, CANCELD, UNKOWN_ERROR
     }
 
-    public DownloadTask(String url, String fileDir, String fileName) {
-        this.url = url;
-        this.fileDir = fileDir;
-        this.fileName = fileName;
+    public interface Callback {
+        public void onStarteded(long contentLength);
+        public void onProgressUpdate(int progress, int count);
+        public void onFinished(State state, String filePath, String errorMsg);
     }
 
-    public void setTaskId(int taskId) {
-        this.taskId = taskId;
+    private static final String TAG = "DownloadTask";
+    private static final int PARAMS_NUM = 2;
+    private Context mContext = null;
+    private Callback mCallback = null;
+    private boolean debug = false;
+    String errorMsg = null;
+    String filePath;
+    private boolean mCanceled = false;
+
+    public DownloadTask(Context context, Callback cb) {
+        mContext = context;
+        mCallback = cb;
     }
 
-    public String getUrl() {
-        return url;
+    @Override
+    protected void onPreExecute() {
+        super.onPreExecute();
+        Log.d(TAG, "pre execute");
     }
 
-    public void setUrl(String url) {
-        this.url = url;
-    }
-
-    public String getFileDir() {
-        return fileDir;
-    }
-
-    public void setFileDir(String fileDir) {
-        this.fileDir = fileDir;
-    }
-
-    public String getFileName() {
+    public String getDefultFileName(String url) {
+        String fileName = "temp.tmp";
+        if (url != null && url.length() > 0) {
+            fileName = url.substring(url.lastIndexOf(File.separator) + 1);
+        }
         return fileName;
     }
 
-    public void setFileName(String fileName) {
-        this.fileName = fileName;
+    @Override
+    protected State doInBackground(String... params) {
+        if (params == null || PARAMS_NUM != params.length) {
+            throw new IllegalArgumentException(TAG + " only accepts " + PARAMS_NUM
+                    + " params.");
+        }
+        String url = params[0];
+        filePath = params[1];
+        if (TextUtils.isEmpty(url)) {
+            throw new IllegalArgumentException("url is null.");
+        } else if (TextUtils.isEmpty(filePath)) {
+            throw new IllegalArgumentException("download path is null.");
+        }
+
+        State state = State.UNKOWN_ERROR;
+        HttpClient httpClient = getHttpClient(mContext);
+        HttpGet request = new HttpGet(url);
+        try {
+            HttpResponse response = httpClient.execute(request);
+            if (response == null
+                    || HttpStatus.SC_OK != response.getStatusLine()
+                            .getStatusCode()) {
+                throw new IOException("url connection error.");
+            }
+            long fileLength = response.getEntity().getContentLength();
+            if (fileLength <= 0) {
+                throw new IOException("download file length is negative.");
+            }
+            if (mCallback != null) {
+                mCallback.onStarteded(fileLength);
+            }
+            Log.i(TAG, "file length:" + fileLength);
+            
+            InputStream input = null;
+            OutputStream output = null;
+            try {
+                if (mCanceled) {
+                    return State.CANCELD;
+                }
+                filePath = createFilePath(filePath, url);
+                if (debug) Log.i(TAG, "url:" + url + ", file path:" + filePath);
+                File file = new File(filePath);
+                input = response.getEntity().getContent();
+                output = new BufferedOutputStream(
+                        new FileOutputStream(file));
+                byte[] buffer = new byte[4 * 1024];
+                int read = -1;
+                int count = 0;
+                int progress = 0;
+                while ((read = input.read(buffer)) != -1) {
+                    if (mCanceled) {
+                        file.delete();
+                        return State.CANCELD;
+                    }
+                    output.write(buffer, 0, read);
+                    count += read;
+                    int pro = (int) (count * 100 / fileLength);
+                    if(pro != progress) {
+                        progress = pro;
+                        publishProgress(progress, count);
+                    }
+                }
+                output.flush();
+                state = State.SUCCESS;
+            } catch (IOException e) {
+                e.printStackTrace();
+                state = State.FILE_IO_ERROR;
+                errorMsg = "File IOException: " + e.getMessage();
+            } finally {
+                if (input != null) {
+                    input.close();
+                }
+                if (output != null) {
+                    output.close();
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+            state = State.HTTP_IO_ERROR;
+            errorMsg = "Connection IOException: " + e.getMessage();
+        }
+        return state;
     }
 
-    public String getFilePath() {
-        File dir = new File(fileDir);
+    @Override
+    protected void onProgressUpdate(Integer... values) {
+        if(debug ) Log.i(TAG, "progress:" + values[0]);
+        super.onProgressUpdate(values);
+        if (mCallback != null) {
+            mCallback.onProgressUpdate(values[0], values[1]);
+        }
+    }
+
+    protected void onPostExecute(State state) {
+        Log.i(TAG, "post execute state:" + state);
+        super.onPostExecute(state);
+        if (mCallback != null) {
+            mCallback.onFinished(state, filePath, errorMsg);
+        }
+    }
+
+    public HttpClient getHttpClient(Context context) {
+        return getHttpClient(context, REQUEST_TIMEOUT, REQUEST_TIMEOUT);
+    }
+
+    public HttpClient getHttpClient(Context context, int connectionTimeout, int socketTimeout) {
+        BasicHttpParams params = new BasicHttpParams();
+        // 设置连接及响应超时时间(s)
+        HttpConnectionParams.setConnectionTimeout(params, connectionTimeout);
+        HttpConnectionParams.setSoTimeout(params, socketTimeout);
+        return new DefaultHttpClient(params);
+    }
+
+    public String createFilePath(String filePath, String url) {
+        File file = new File(filePath);
+        if (file.isDirectory()) {
+            filePath = filePath + "/" + getDefultFileName(url);
+        }
+        if(file.isFile() && file.exists()) {
+            file.delete();
+            System.out.println("DELETE file: " + filePath);
+        }
+        File dir = new File(file.getParent());
         if(!dir.exists()) {
             dir.mkdirs();
-        }
-        String filePath = fileDir + fileName;
-        File file = new File(filePath);
-        if(file.exists()) {
-            deleteFile(file);
-            System.out.println("DELETE file: " + filePath);
         }
         try {
             boolean res = file.createNewFile();
@@ -87,102 +203,7 @@ public class DownloadTask implements Runnable {
         return filePath;
     }
 
-    private void deleteFile(File file) {
-        if(file != null && file.exists()) {
-            file.delete();
-        }
-    }
-
-    public DownloadCallback getCallback() {
-        return callback;
-    }
-
-    public void setCallback(DownloadCallback callback) {
-        this.callback = callback;
-    }
-
-    public void setTimeoutMillis(int timeoutMillis) {
-        this.timeoutMillis = timeoutMillis;
-    }
-
     public void setCanceled(boolean canceled) {
-        this.canceled = canceled;
-    }
-
-    @Override
-    public void run() {
-        downloadFile();
-    }
-
-    public boolean downloadFile() {
-        InputStream input = null;
-        FileOutputStream output = null;
-        String errorMsg = null;
-        String filePath = null;
-        try {
-            if (canceled) return false;
-            URL _url = new URL(url);
-            HttpURLConnection urlConn = (HttpURLConnection) _url
-                    .openConnection();
-            urlConn.setConnectTimeout(timeoutMillis);
-            int len = urlConn.getContentLength();
-            if(callback != null) {
-                callback.onDownloadStart(taskId, len);
-            }
-            if(len <= 0) {
-                errorMsg = "Content Length is 0";
-                return false;
-            }
-            input = urlConn.getInputStream();
-            int count = 0;
-            if(input != null) {
-                filePath = getFilePath();
-                File file = new File(filePath);
-                output = new FileOutputStream(file);
-                byte[] buffer = new byte[1024];
-                int read = 0;
-                while ((read = input.read(buffer)) != -1) {
-                    output.write(buffer);
-                    count += read;
-                    if(callback != null) {
-                        int progress = (count * 100) / len;
-                        callback.onDownloadProgress(taskId, progress, count);
-                    }
-                    if (canceled) {
-                        deleteFile(file);
-                        output.close();
-                        return false;
-                    }
-                    try {
-                        Thread.sleep(100);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-        } catch (MalformedURLException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
-            e.printStackTrace();
-        } finally {
-            if(input != null)
-                try {
-                    input.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            if(output != null) {
-                try {
-                    output.flush();
-                    output.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-            if(callback != null) {
-                callback.onDownloadFinished(taskId, filePath, errorMsg);
-            }
-        }
-        return true;
+        mCanceled  = canceled;
     }
 }
