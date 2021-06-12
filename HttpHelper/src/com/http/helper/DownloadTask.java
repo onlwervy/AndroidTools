@@ -28,8 +28,12 @@ import java.io.OutputStream;
  * 参数为url及保存路径
  */
 public class DownloadTask extends
-        AsyncTask<String, Integer, State> {
+        AsyncTask<String, Integer, DownloadTask.State> {
     public static final int REQUEST_TIMEOUT = 60 * 1000;
+
+    public static enum State {
+        SUCCESS, HTTP_IO_ERROR, FILE_IO_ERROR, CANCELD, UNKOWN_ERROR
+    }
 
     public interface Callback {
         public void onStarteded(long contentLength);
